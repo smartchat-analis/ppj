@@ -1,0 +1,7 @@
+/data/*
+/model/*
+chatbot.db
+.env
+__pycache__/
+*.pyc
+logs/
