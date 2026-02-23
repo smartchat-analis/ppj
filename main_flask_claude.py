@@ -1,10 +1,8 @@
-import json
 import os
 from dotenv import load_dotenv
 load_dotenv()
 import uuid
 import re
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
@@ -17,19 +15,17 @@ except ImportError:
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from db import (
-    insert_chat_pair,
-    fetch_context,
-    fetch_dataset_by_intent
-)
-from db import insert_chat_pair, fetch_next_turn_index
 from db import apply_feedback_db
+from db import fetch_context
+from db import fetch_dataset_by_intent
+from db import fetch_next_turn_index
+from db import insert_chat_pair
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY belum diset.")
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 CLAUDE_CLIENT = Anthropic(api_key=CLAUDE_API_KEY) if Anthropic and CLAUDE_API_KEY else None
 
@@ -75,8 +71,7 @@ REQUIRED_PLACEHOLDERS = {
 # ============================================================
 # LOAD DATASET
 # ============================================================
-def clean_bot_output(text):  #bersihin data 
-    text = re.sub(r"[ð]+", "", text)
+def clean_bot_output(text):
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -110,6 +105,7 @@ def handle_llm_claude(messages, system_prompt=None, model=CLAUDE_MODEL, max_toke
     if system_prompt:
         payload["system"] = system_prompt
 
+    logger.info(f"[CLAUDE MODEL IN USE] model={model}")
     res = CLAUDE_CLIENT.messages.create(**payload)
     parts = [
         block.text for block in res.content
@@ -214,12 +210,22 @@ def classify_intent_gpt(user_text, context):
     inferred_parent = "lainnya"
     inferred_child = "tidak_jelas"
 
-    for line in res.split("\n"):
-        s = line.lower().strip()
-        if s.startswith("inferred_parent:"):
-            inferred_parent = s.replace("inferred_parent:", "").strip()
-        elif s.startswith("inferred_child:"):
-            inferred_child = s.replace("inferred_child:", "").strip()
+    text = (res or "").strip().lower()
+    parent_match = re.search(
+        r"inferred_parent\s*:\s*(.+?)(?=\s+inferred_child\s*:|$)",
+        text,
+        flags=re.S
+    )
+    child_match = re.search(
+        r"inferred_child\s*:\s*(.+)$",
+        text,
+        flags=re.S
+    )
+
+    if parent_match:
+        inferred_parent = parent_match.group(1).strip()
+    if child_match:
+        inferred_child = child_match.group(1).strip()
     return inferred_parent, inferred_child
 
 # ============================================================
@@ -431,20 +437,20 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
         - Nama domain klien
         - Tagihan spesifik klien
 
-        ➜ Data ini TIDAK BOLEH muncul sebagai angka, tanggal, atau teks nyata.
-        ➜ WAJIB menggunakan placeholder {{...}} jika relevan.
+        Data ini TIDAK BOLEH muncul sebagai angka, tanggal, atau teks nyata.
+        WAJIB menggunakan placeholder {{...}} jika relevan.
 
     2. DATA YANG BOLEH DITULIS SECARA LITERAL:
         - Kode layanan atau paket
         - Informasi pembayaran umum
         - Nomor customer service
         - Informasi operasional non-klien
-        ➜ Data ini BOLEH ditampilkan apa adanya jika sudah ada di draft.
+        Data ini BOLEH ditampilkan apa adanya jika sudah ada di draft.
 
     3. Jika menemukan angka:
         - Periksa konteks kalimatnya
-        - Jika angka terkait DATA KLIEN → GUNAKAN PLACEHOLDER
-        - Jika angka terkait DATA UMUM → BIARKAN
+        - Jika angka terkait DATA KLIEN GUNAKAN PLACEHOLDER
+        - Jika angka terkait DATA UMUM BIARKAN
 
     4. DILARANG:
         - Menghapus nomor rekening yang sudah benar
@@ -468,11 +474,11 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
         - BUKAN objek
         - BUKAN keterangan tambahan
 
-    ✔ BOLEH:
+    1. BOLEH:
     - "Biaya perpanjangan: {{$biaya_ppj_web}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
 
-    ✘ DILARANG:
+    2. DILARANG:
     - "informasi {{$biaya_ppj_web}}"
     - "detail {{$domain_klien}}"
 
@@ -601,8 +607,7 @@ def home():
 @app.route("/chat", methods=["POST"])
 def chat():
     payload = request.get_json(silent=True) or {}
-    user_query = payload.get("query") or payload.get("q")
-    user_query = normalize_user_query(user_query)
+    user_query = normalize_user_query(payload.get("query") or payload.get("q"))
     conversation_id = payload.get("conversation_id")
 
     if conversation_id:
@@ -610,9 +615,6 @@ def chat():
     else:
         conversation_id = int(uuid.uuid4().int % 1_000_000_000)
 
-    if not user_query:
-        return jsonify({"error": "query required"}), 400
-    
     logger.info(
         f"[REQUEST] conversation_id={conversation_id} | query='{user_query}'"
     )
@@ -644,7 +646,11 @@ def chat():
         logger.exception(
             f"[OPENAI AUTH ERROR] session_id={session_id} | invalid OPENAI_API_KEY"
         )
-    
+        return jsonify({
+            "error": "openai_authentication_failed",
+            "message": "OPENAI_API_KEY tidak valid."
+        }), 401
+
     # === GET INTENT RESULT ===
     try:
         inferred_parent, inferred_child = intent_future.result()
@@ -652,9 +658,9 @@ def chat():
         logger.error(
             f"[INTENT ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
-    )
+        )
         inferred_parent, inferred_child = "lainnya", "tidak_jelas"
-    
+
     logger.info(
         f"[INTENT] session_id={session_id} | parent={inferred_parent} | child={inferred_child}"
     )
@@ -662,6 +668,7 @@ def chat():
     logger.debug(
         f"[EMBEDDING] session_id={session_id} | vector_dim={len(query_embedding)}"
     )
+
     # === RETRIEVAL (DATA LAMA) ===
     dataset = fetch_dataset_by_intent(
         inferred_parent if inferred_parent != "lainnya" else None
@@ -670,26 +677,20 @@ def chat():
     logger.info(
         f"[RETRIEVAL] intent_parent={inferred_parent} | candidates={len(df_retrieval)}"
     )
+
     if df_retrieval.empty:
         bot_text = "Baik kak, untuk hal ini kami perlu cek dulu ke tim terkait ya 🙏"
-
-        turn_index = fetch_next_turn_index(conversation_id)
-
-        insert_chat_pair({
-            "conversation_id": conversation_id,
-            "session_id": session_id,
-            "turn_index": turn_index,
-            "user_message": user_query,
-            "admin_response": bot_text,
-            "context": context_list,
-            "intent_parent": inferred_parent,
-            "intent_child": inferred_child,
-            "priority_score": 50,
-            "reward_count": 0,
-            "punish_count": 0,
-            "embedding": query_embedding
-        })
-
+        save_chat_to_db(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            user_message=user_query,
+            admin_response=bot_text,
+            context=context_list,
+            intent_parent=inferred_parent,
+            intent_child=inferred_child,
+            priority_score=50,
+            embedding=query_embedding
+        )
         return jsonify({
             "status": "ok",
             "admin_response": bot_text
@@ -707,34 +708,41 @@ def chat():
         logger.warning(
             f"[RETRIEVAL EMPTY] session_id={session_id}"
         )
-    if matches_df is None or len(matches_df) == 0:
-        top_similarity = 0.0
-        top_match = None
-    else:
-        top_match = matches_df.iloc[0]
-        top_similarity = float(top_match["similarity"])
 
     matches_summary = []
-    if matches_df is not None:
-        for _, r in matches_df.iterrows():
-            matches_summary.append({
-                "conversation_id": int(r["conversation_id"]) if not pd.isna(r["conversation_id"]) else None,
-                "intent_parent": r.get("intent_parent"),
-                "intent_child": r.get("intent_child"),
-                "user_message": r.get("user_message"),
-                "admin_response": r.get("admin_response"),
-                "similarity" : float(r.get("similarity") or 0.0),
-                "priority_score": float(r.get("priority_score") or 0.0),
-                "final_score": float(r.get("final_score") or 0.0)
-            })
- 
-    # =====================================================
-    # GENERATE RESPONSE
-    # =====================================================
+    for _, r in matches_df.iterrows():
+        matches_summary.append({
+            "conversation_id": int(r["conversation_id"]) if not pd.isna(r["conversation_id"]) else None,
+            "intent_parent": r.get("intent_parent"),
+            "intent_child": r.get("intent_child"),
+            "user_message": r.get("user_message"),
+            "admin_response": r.get("admin_response"),
+            "similarity": float(r.get("similarity") or 0.0),
+            "priority_score": float(r.get("priority_score") or 0.0),
+            "final_score": float(r.get("final_score") or 0.0)
+        })
 
-    draft_text = generate_bot_reply_with_context(
-        user_query, context_text, matches_df
-    )
+    # === GENERATE RESPONSE ===
+    try:
+        draft_text = generate_bot_reply_with_context(
+            user_query, context_text, matches_df
+        )
+    except Exception as e:
+        logger.error(
+            f"[CLAUDE GENERATION ERROR] session_id={session_id} | {str(e)}",
+            exc_info=True
+        )
+        return jsonify({
+            "error": "claude_generation_failed",
+            "message": str(e)
+        }), 502
+
+    if not draft_text:
+        return jsonify({
+            "error": "claude_generation_failed",
+            "message": "Claude tidak mengembalikan respons."
+        }), 502
+
     logger.info(
         f"[LAYER-1 DRAFT] session_id={session_id} | "
         f"answer={draft_text}"
@@ -762,33 +770,25 @@ def chat():
         f"[FINAL CONTENT]\n{bot_text}"
     )
 
-    # =====================================================
-    # GENERATE & SAVE
-    # =====================================================
-
+    # === SAVE ===
     turn_index = fetch_next_turn_index(conversation_id)
-
-    new_row = {
-        "conversation_id": conversation_id,
-        "session_id": session_id,
-        "turn_index": turn_index,
-        "user_message": user_query,
-        "admin_response": bot_text,
-        "context": context_list,
-        "intent_parent": inferred_parent,
-        "intent_child": inferred_child,
-        "priority_score": 50,
-        "reward_count": 0,
-        "punish_count": 0,
-        "embedding": query_embedding
-    }
-
     logger.info(
         f"[DB INSERT] conversation_id={conversation_id} | "
         f"turn_index={turn_index} | session_id={session_id}"
     )
+
     try:
-        insert_chat_pair(new_row)
+        save_chat_to_db(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            user_message=user_query,
+            admin_response=bot_text,
+            context=context_list,
+            intent_parent=inferred_parent,
+            intent_child=inferred_child,
+            priority_score=50,
+            embedding=query_embedding
+        )
     except Exception as e:
         logger.critical(
             f"[DB ERROR] session_id={session_id} | {str(e)}",
