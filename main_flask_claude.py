@@ -349,6 +349,7 @@ def build_prompt_from_matches(user_text, matches_df):
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
+    - "Setelah mendapatkan diskon, harga akhir adalah  = {{$biaya_ppj_web : -50000}}"
 
     CONTOH SALAH (DILARANG):
     - "informasi {{$jatuh_tempo}}"
