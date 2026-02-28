@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import uuid
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pandas as pd
 import numpy as np
@@ -56,6 +56,11 @@ CLIENT = OpenAI(api_key=OPENAI_API_KEY)
 TOP_K = 3
 EXECUTOR = ThreadPoolExecutor(max_workers=2,
                               thread_name_prefix="openai-worker-")
+CHAT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("CHAT_MAX_WORKERS", "8")),
+    thread_name_prefix="chat-worker-"
+)
+CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))
 
 # ============================================================
 # PLACEHOLDERS
@@ -330,14 +335,21 @@ def build_prompt_from_matches(user_text, matches_df):
     ATURAN MUTLAK (WAJIB DIPATUHI):
     - Jika user menanyakan biaya, jatuh tempo, atau nama website:
       WAJIB gunakan placeholder variabel {{...}} persis seperti tertulis.
+    - Harga dalam placeholder {{$biaya_ppj_web}} hanya merujuk pada biaya perpanjangan, untuk pertanyaan layanan lain yang menyebutkan harga, pastikan untuk konfirmasi terlebih dahulu kepada tim.
     - DILARANG mengganti placeholder dengan nilai contoh dari database.
     - DILARANG mengira-ngira.
     - Jika melanggar aturan ini, jawaban dianggap SALAH.
     - Mengarahkan user ke pembuatan invoice TIDAK BOLEH dilakukan jika user secara langsung meminta nomor rekening
+    - Jika user menanyakan diskon / harga setelah diskon:
+      {{$biaya_ppj_web}} WAJIB diperlakukan sebagai HARGA DASAR (sebelum diskon), bukan harga final.
+    - Harga final wajib dijelaskan sebagai hasil pengurangan dari {{$biaya_ppj_web}} dengan nominal diskon.
+    - Jangan membuat placeholder baru untuk harga akhir.
+    - Jika nominal diskon sudah disebutkan user/admin, Anda boleh menuliskan nominal diskon secara literal.
 
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
+    - "Setelah mendapatkan diskon, harga akhir adalah  = {{$biaya_ppj_web : -50000}}"
 
     CONTOH SALAH (DILARANG):
     - "informasi {{$jatuh_tempo}}"
@@ -346,7 +358,9 @@ def build_prompt_from_matches(user_text, matches_df):
     FORMAT JAWABAN:
     - Gunakan bahasa profesional dan ramah
     - Placeholder {{...}} HARUS DITULIS UTUH, TIDAK BOLEH DIMODIFIKASI
-    - Jangan menambahkan angka atau tanggal selain placeholder
+    - Jangan menambahkan angka atau tanggal selain placeholder, kecuali nominal diskon yang memang sudah eksplisit di percakapan.
+    - Untuk pembahasan diskon, jelaskan rumus dengan tegas:
+      "Harga akhir = {{$biaya_ppj_web}} - <nominal_diskon>"
 
     PRIORITAS JAWABAN:
     1. Jika user bertanya "nomor rekening", "rekening pembayaran", "transfer ke mana","bayar ke mana"
@@ -366,6 +380,8 @@ def build_prompt_from_matches(user_text, matches_df):
         - Pengeditan sederhana di website seperti mengganti Nomor telepon/WA, dan Alamat usaha (jika pindah alamat)
         - Desain Bisnis gratis : banner/kartu nama/logo (pilih salah satu) dapat dikirim dalam file PSD.
     2. Selalu tekankan layanan GRATIS ini dalam jawaban Anda jika relevan, jika klien menanyakan diluar layanan gratis, maka jawab dengan sopan bahwa layanan tersebut di luar layanan gratis dan ada tambahan biaya, kemudian izin untuk menginformasikan ke tim terkait.
+    3. Berikan juga informasi bahwa :
+        - Jika website sudah lebih dari 30 hari tidak aktif, maka website akan memasuki redemption period sehingga harus ganti nama domain nantinya dan akan ada biaya tambahan sesuai paket yang diambil. 
 
     Berikut adalah {len(matches_df)} percakapan paling mirip dari database:
 
@@ -607,6 +623,26 @@ def home():
 @app.route("/chat", methods=["POST"])
 def chat():
     payload = request.get_json(silent=True) or {}
+    future = CHAT_EXECUTOR.submit(process_chat_request, payload)
+    try:
+        result, status_code = future.result(timeout=CHAT_TIMEOUT_SECONDS)
+        return jsonify(result), status_code
+    except TimeoutError:
+        logger.error(
+            f"[CHAT TIMEOUT] exceeded {CHAT_TIMEOUT_SECONDS} seconds"
+        )
+        return jsonify({
+            "error": "chat_timeout",
+            "message": "Permintaan terlalu lama diproses, silakan coba lagi."
+        }), 504
+    except Exception as e:
+        logger.exception(f"[CHAT EXECUTOR ERROR] {str(e)}")
+        return jsonify({
+            "error": "chat_processing_failed",
+            "message": str(e)
+        }), 500
+
+def process_chat_request(payload):
     user_query = normalize_user_query(payload.get("query") or payload.get("q"))
     conversation_id = payload.get("conversation_id")
 
@@ -622,7 +658,7 @@ def chat():
         logger.warning(
             f"[INVALID REQUEST] conversation_id={conversation_id} | empty query"
         )
-        return jsonify({"error": "query required"}), 400
+        return {"error": "query required"}, 400
 
     # === CONTEXT ===
     context_list = fetch_context(conversation_id)
@@ -646,10 +682,10 @@ def chat():
         logger.exception(
             f"[OPENAI AUTH ERROR] session_id={session_id} | invalid OPENAI_API_KEY"
         )
-        return jsonify({
+        return {
             "error": "openai_authentication_failed",
             "message": "OPENAI_API_KEY tidak valid."
-        }), 401
+        }, 401
 
     # === GET INTENT RESULT ===
     try:
@@ -669,7 +705,7 @@ def chat():
         f"[EMBEDDING] session_id={session_id} | vector_dim={len(query_embedding)}"
     )
 
-    # === RETRIEVAL (DATA LAMA) ===
+    # === RETRIEVAL===
     dataset = fetch_dataset_by_intent(
         inferred_parent if inferred_parent != "lainnya" else None
     )
@@ -691,10 +727,10 @@ def chat():
             priority_score=50,
             embedding=query_embedding
         )
-        return jsonify({
+        return {
             "status": "ok",
             "admin_response": bot_text
-        })
+        }, 200
 
     matches_df = retrieve_top_k(query_embedding, df_retrieval, TOP_K)
     if not matches_df.empty:
@@ -732,16 +768,16 @@ def chat():
             f"[CLAUDE GENERATION ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
         )
-        return jsonify({
+        return {
             "error": "claude_generation_failed",
             "message": str(e)
-        }), 502
+        }, 502
 
     if not draft_text:
-        return jsonify({
+        return {
             "error": "claude_generation_failed",
             "message": "Claude tidak mengembalikan respons."
-        }), 502
+        }, 502
 
     logger.info(
         f"[LAYER-1 DRAFT] session_id={session_id} | "
@@ -796,7 +832,7 @@ def chat():
         )
         raise
 
-    return jsonify({
+    return {
         "status": "ok",
         "save_mode": "saved_to_dataset",
         "session_id": session_id,
@@ -805,7 +841,7 @@ def chat():
         "intent_parent": inferred_parent,
         "intent_child": inferred_child,
         "matches": matches_summary
-    })
+    }, 200
 
 # ============================================================
 # ENDPOINT /feedback
