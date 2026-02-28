@@ -345,7 +345,7 @@ def build_prompt_from_matches(user_text, matches_df):
     - Harga final wajib dijelaskan sebagai hasil pengurangan dari {{$biaya_ppj_web}} dengan nominal diskon.
     - Jangan membuat placeholder baru untuk harga akhir.
     - Jika nominal diskon sudah disebutkan user/admin, Anda boleh menuliskan nominal diskon secara literal.
-
+    - Jangan gunakan Rp pada penjelasan harga, cukup gunakan angka dalam penjelasan nominal diskon, boleh gunakan pada harga final.
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
