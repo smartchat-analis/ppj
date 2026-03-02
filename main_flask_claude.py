@@ -340,16 +340,19 @@ def build_prompt_from_matches(user_text, matches_df):
     - DILARANG mengira-ngira.
     - Jika melanggar aturan ini, jawaban dianggap SALAH.
     - Mengarahkan user ke pembuatan invoice TIDAK BOLEH dilakukan jika user secara langsung meminta nomor rekening
+
+    Untuk placeholder {{$biaya_ppj_web}}, ada beberapa parameter yang bisa dipertimbangkan:
     - Jika user menanyakan diskon / harga setelah diskon:
       {{$biaya_ppj_web}} WAJIB diperlakukan sebagai HARGA DASAR (sebelum diskon), bukan harga final.
     - Harga final wajib dijelaskan sebagai hasil pengurangan dari {{$biaya_ppj_web}} dengan nominal diskon.
-    - Jangan membuat placeholder baru untuk harga akhir.
     - Jika nominal diskon sudah disebutkan user/admin, Anda boleh menuliskan nominal diskon secara literal.
-
+    - Setelah mendapatkan diskon, harga akhir adalah  = {{$biaya_ppj_web - <nominal_diskon>}}
+        misalnya : " Harga setelah diskon adalah {{$biaya_ppj_web - 50000}}" dan berikan harga final setelah operasi pengurangan tersebut.
+    - Jangan gunakan Rp pada penjelasan harga, cukup gunakan angka dalam penjelasan nominal diskon, boleh gunakan pada harga final.
+    
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
-    - "Setelah mendapatkan diskon, harga akhir adalah  = {{$biaya_ppj_web : -50000}}"
 
     CONTOH SALAH (DILARANG):
     - "informasi {{$jatuh_tempo}}"
@@ -359,8 +362,6 @@ def build_prompt_from_matches(user_text, matches_df):
     - Gunakan bahasa profesional dan ramah
     - Placeholder {{...}} HARUS DITULIS UTUH, TIDAK BOLEH DIMODIFIKASI
     - Jangan menambahkan angka atau tanggal selain placeholder, kecuali nominal diskon yang memang sudah eksplisit di percakapan.
-    - Untuk pembahasan diskon, jelaskan rumus dengan tegas:
-      "Harga akhir = {{$biaya_ppj_web}} - <nominal_diskon>"
 
     PRIORITAS JAWABAN:
     1. Jika user bertanya "nomor rekening", "rekening pembayaran", "transfer ke mana","bayar ke mana"
