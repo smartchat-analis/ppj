@@ -342,17 +342,16 @@ def build_prompt_from_matches(user_text, matches_df):
     - Mengarahkan user ke pembuatan invoice TIDAK BOLEH dilakukan jika user secara langsung meminta nomor rekening
 
     Untuk placeholder {{$biaya_ppj_web}}, ada beberapa parameter yang bisa dipertimbangkan:
-    - Jika user menanyakan diskon / harga setelah diskon:
-      {{$biaya_ppj_web}} WAJIB diperlakukan sebagai HARGA DASAR (sebelum diskon), bukan harga final.
-    - Harga final wajib dijelaskan sebagai hasil pengurangan dari {{$biaya_ppj_web}} dengan nominal diskon.
-    - Jika nominal diskon sudah disebutkan user/admin, Anda boleh menuliskan nominal diskon secara literal.
-    - Setelah mendapatkan diskon, harga akhir adalah  = {{$biaya_ppj_web - <nominal_diskon>}}
-        misalnya : " Harga setelah diskon adalah {{$biaya_ppj_web - 50000}}" dan berikan harga final setelah operasi pengurangan tersebut.
-    - Jangan gunakan Rp pada penjelasan harga, cukup gunakan angka dalam penjelasan nominal diskon, boleh gunakan pada harga final.
+    - Jika user menanyakan informasi tambahan untuk biaya perpanjangan, maka gunakan fill_user_info_ppj({{$biaya_ppj_web}}, plus_or_minus, value)
+        untuk menjelaskan biaya perpanjangan dengan penambahan atau pengurangan tertentu, misalnya untuk layanan tambahan atau diskon.
+        Misalnya : "Biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 100000) karena ada tambahan layanan X" atau "Biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000) karena Anda mendapatkan diskon Y"
+    - Maka, output placeholder {{$biaya_ppj_web}} adalah hasil dari fill_user_info_ppj yang sudah dihitung dan dijelaskan operasinya.
     
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
+    - Misalkan {{$biaya_ppj_web}} adalah 600000 dan klien mendapatkan diskon sebesar 50000, 
+    maka fungsi fill_user_info_ppj({{600000}}, minus, 50000) sehingga harga akhir {{$biaya_ppj_web}} adalah {{550000}}
 
     CONTOH SALAH (DILARANG):
     - "informasi {{$jatuh_tempo}}"
