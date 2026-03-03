@@ -341,11 +341,14 @@ def build_prompt_from_matches(user_text, matches_df):
     - Jika melanggar aturan ini, jawaban dianggap SALAH.
     - Mengarahkan user ke pembuatan invoice TIDAK BOLEH dilakukan jika user secara langsung meminta nomor rekening
 
-    Untuk placeholder {{$biaya_ppj_web}}, ada beberapa parameter yang bisa dipertimbangkan:
+    Untuk harga perpanjangan, ada beberapa parameter yang bisa dipertimbangkan:
     - Jika user menanyakan informasi tambahan untuk biaya perpanjangan, maka gunakan fill_user_info_ppj({{$biaya_ppj_web}}, plus_or_minus, value)
         untuk menjelaskan biaya perpanjangan dengan penambahan atau pengurangan tertentu, misalnya untuk layanan tambahan atau diskon.
-        Misalnya : "Biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 100000) karena ada tambahan layanan X" atau "Biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000) karena Anda mendapatkan diskon Y"
-    - Maka, output placeholder {{$biaya_ppj_web}} adalah hasil dari fill_user_info_ppj yang sudah dihitung dan dijelaskan operasinya.
+        Aplikasinya seperti ini: 
+        - Jika terdapat tambahan biaya layanan, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 100000) karena ada tambahan layanan X 
+        - Jika terdapat diskon, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000) karena mendapatkan diskon Y
+        - Jika tidak ada tambahan biaya atau diskon, maka cukup sebutkan biaya perpanjangan adalah {{$biaya_ppj_web}} tanpa perlu menggunakan fill_user_info_ppj
+    - Maka, untuk layanan tambahan output placeholder {{$biaya_ppj_web}} adalah hasil dari fill_user_info_ppj yang sudah dihitung dan dijelaskan operasinya.
     
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
