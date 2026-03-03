@@ -433,7 +433,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     - TIDAK menghapus maksud jawaban
 
     TUGAS UTAMA:
-    Memastikan jawaban MEMATUHI kontrak PLACEHOLDER.
+    Memastikan jawaban MEMATUHI kontrak PLACEHOLDER dengan ketentuan yang sudah diterapkan sebelumnya.
 
     ====================================
     DATA
@@ -452,9 +452,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
 
     1. DATA YANG WAJIB DILINDUNGI DENGAN PLACEHOLDER:
         - Jatuh tempo / tanggal aktif
-        - Biaya perpanjangan individual
         - Nama domain klien
-        - Tagihan spesifik klien
 
         Data ini TIDAK BOLEH muncul sebagai angka, tanggal, atau teks nyata.
         WAJIB menggunakan placeholder {{...}} jika relevan.
@@ -464,12 +462,14 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
         - Informasi pembayaran umum
         - Nomor customer service
         - Informasi operasional non-klien
+        - Biaya perpanjangan setelah operasi tambahan/diskon atau tagihan spesifik klien
         Data ini BOLEH ditampilkan apa adanya jika sudah ada di draft.
 
     3. Jika menemukan angka:
         - Periksa konteks kalimatnya
         - Jika angka terkait DATA KLIEN GUNAKAN PLACEHOLDER
         - Jika angka terkait DATA UMUM BIARKAN
+        - Jika angka terkait BIAYA PERPANJANGAN, pastikan untuk menggunakan fungsi fill_user_info_ppj jika ada operasi tambahan atau diskon, sehingga angka final tetap dalam placeholder.
 
     4. DILARANG:
         - Menghapus nomor rekening yang sudah benar
@@ -513,6 +513,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     PENGECUALIAN PENTING:
     - Jika USER secara eksplisit meminta NOMOR REKENING atau INFO PEMBAYARAN UMUM
     - DAN data tersebut adalah DATA UMUM (bukan spesifik klien)
+    - DAN data tersebut merupakan placeholder hasil operasi tambahan/diskon untuk biaya perpanjangan
     - MAKA Anda BOLEH menambahkan informasi tersebut meskipun tidak ada di draft
 
     ====================================
