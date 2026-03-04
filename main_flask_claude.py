@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 load_dotenv()
 import uuid
 import re
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pandas as pd
@@ -20,6 +22,7 @@ from db import fetch_context
 from db import fetch_dataset_by_intent
 from db import fetch_next_turn_index
 from db import insert_chat_pair
+from log_db import init_log_db, insert_chat_log
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -61,6 +64,7 @@ CHAT_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="chat-worker-"
 )
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))
+init_log_db()
 
 # ============================================================
 # PLACEHOLDERS
@@ -335,6 +339,7 @@ def build_prompt_from_matches(user_text, matches_df):
     ATURAN MUTLAK (WAJIB DIPATUHI):
     - Jika user menanyakan biaya, jatuh tempo, atau nama website:
       WAJIB gunakan placeholder variabel {{...}} persis seperti tertulis.
+    - Pertanyaan terkait nama website harus menyebutkan placeholder {{$domain_klien}} untuk merujuk pada nama domain klien.
     - Harga dalam placeholder {{$biaya_ppj_web}} hanya merujuk pada biaya perpanjangan, untuk pertanyaan layanan lain yang menyebutkan harga, pastikan untuk konfirmasi terlebih dahulu kepada tim.
     - DILARANG mengganti placeholder dengan nilai contoh dari database.
     - DILARANG mengira-ngira.
@@ -349,12 +354,14 @@ def build_prompt_from_matches(user_text, matches_df):
         - Jika terdapat diskon, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000) karena mendapatkan diskon Y
         - Jika tidak ada tambahan biaya atau diskon, maka cukup sebutkan biaya perpanjangan adalah {{$biaya_ppj_web}} tanpa perlu menggunakan fill_user_info_ppj
     - Maka, untuk layanan tambahan output placeholder {{$biaya_ppj_web}} adalah hasil dari fill_user_info_ppj yang sudah dihitung dan dijelaskan operasinya.
+    - Fungsi fill_user_info_ppj({{$biaya_ppj_web}}, plus_or_minus, value) adalah perhitungan internal yang kamu lakukan, bukan kalimat literal yang dituliskan ke user. Jadi pastikan untuk melakukan perhitungan terlebih dahulu sebelum menyebutkan biaya akhir kepada user.
+    - Misalkan {{$biaya_ppj_web}} adalah 600000 dan klien mendapatkan diskon sebesar 50000, 
+    maka fungsi fill_user_info_ppj({{600000}}, minus, 50000) sehingga harga akhir {{$biaya_ppj_web}} adalah {{550000}}
     
     CONTOH BENAR:
     - "Jatuh tempo perpanjangan: {{$jatuh_tempo}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
-    - Misalkan {{$biaya_ppj_web}} adalah 600000 dan klien mendapatkan diskon sebesar 50000, 
-    maka fungsi fill_user_info_ppj({{600000}}, minus, 50000) sehingga harga akhir {{$biaya_ppj_web}} adalah {{550000}}
+    - "Website {{$domain_klien}} ya kak, jatuh tempo perpanjangan sampai {{$jatuh_tempo}}"
 
     CONTOH SALAH (DILARANG):
     - "informasi {{$jatuh_tempo}}"
@@ -635,25 +642,103 @@ def chat():
         logger.error(
             f"[CHAT TIMEOUT] exceeded {CHAT_TIMEOUT_SECONDS} seconds"
         )
+        try:
+            insert_chat_log({
+                "status": "chat_timeout",
+                "error_code": "chat_timeout",
+                "error_message": f"exceeded {CHAT_TIMEOUT_SECONDS} seconds",
+                "payload": payload,
+                "thread_name": threading.current_thread().name,
+            })
+        except Exception:
+            logger.exception("[LOG_DB ERROR] failed to write chat_timeout log")
         return jsonify({
             "error": "chat_timeout",
             "message": "Permintaan terlalu lama diproses, silakan coba lagi."
         }), 504
     except Exception as e:
         logger.exception(f"[CHAT EXECUTOR ERROR] {str(e)}")
+        try:
+            insert_chat_log({
+                "status": "chat_processing_failed",
+                "error_code": "chat_processing_failed",
+                "error_message": str(e),
+                "payload": payload,
+                "thread_name": threading.current_thread().name,
+            })
+        except Exception:
+            logger.exception("[LOG_DB ERROR] failed to write chat_processing_failed log")
         return jsonify({
             "error": "chat_processing_failed",
             "message": str(e)
         }), 500
 
 def process_chat_request(payload):
+    started_at = time.perf_counter()
+    thread_name = threading.current_thread().name
+    session_id = str(uuid.uuid4())
+
+    context_list = []
+    context_text = ""
+    inferred_parent = None
+    inferred_child = None
+    retrieval_candidates = 0
+    matches_summary = []
+    top_similarity = None
+    top_priority_score = None
+    top_final_score = None
+    draft_text = None
+    bot_text = None
+
+    def write_log(status, conversation_id, user_query, error_code=None, error_message=None, admin_response=None):
+        try:
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
+            insert_chat_log({
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "status": status,
+                "error_code": error_code,
+                "error_message": error_message,
+                "user_query": user_query,
+                "context_turns": len(context_list),
+                "context_text": context_text,
+                "intent_parent": inferred_parent,
+                "intent_child": inferred_child,
+                "retrieval_candidates": retrieval_candidates,
+                "top_similarity": top_similarity,
+                "top_priority_score": top_priority_score,
+                "top_final_score": top_final_score,
+                "matches": matches_summary,
+                "layer1_draft": draft_text,
+                "layer2_final": bot_text,
+                "admin_response": admin_response,
+                "payload": payload,
+                "duration_ms": duration_ms,
+                "thread_name": thread_name,
+            })
+        except Exception as e:
+            logger.error(f"[LOG_DB ERROR] session_id={session_id} | {str(e)}", exc_info=True)
+
     user_query = normalize_user_query(payload.get("query") or payload.get("q"))
     conversation_id = payload.get("conversation_id")
 
-    if conversation_id:
-        conversation_id = int(conversation_id)
-    else:
-        conversation_id = int(uuid.uuid4().int % 1_000_000_000)
+    try:
+        if conversation_id:
+            conversation_id = int(conversation_id)
+        else:
+            conversation_id = int(uuid.uuid4().int % 1_000_000_000)
+    except (TypeError, ValueError):
+        write_log(
+            status="invalid_conversation_id",
+            conversation_id=None,
+            user_query=user_query,
+            error_code="invalid_conversation_id",
+            error_message="conversation_id harus integer"
+        )
+        return {
+            "error": "invalid_conversation_id",
+            "message": "conversation_id harus integer"
+        }, 400
 
     logger.info(
         f"[REQUEST] conversation_id={conversation_id} | query='{user_query}'"
@@ -661,6 +746,13 @@ def process_chat_request(payload):
     if not user_query:
         logger.warning(
             f"[INVALID REQUEST] conversation_id={conversation_id} | empty query"
+        )
+        write_log(
+            status="invalid_request",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            error_code="query_required",
+            error_message="query required"
         )
         return {"error": "query required"}, 400
 
@@ -670,7 +762,6 @@ def process_chat_request(payload):
     logger.debug(
         f"[CONTEXT] conversation_id={conversation_id} | turns={len(context_list)}"
     )
-    session_id = str(uuid.uuid4())
     logger.info(
         f"[SESSION] conversation_id={conversation_id} | session_id={session_id}"
     )
@@ -685,6 +776,13 @@ def process_chat_request(payload):
     except AuthenticationError:
         logger.exception(
             f"[OPENAI AUTH ERROR] session_id={session_id} | invalid OPENAI_API_KEY"
+        )
+        write_log(
+            status="openai_auth_failed",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            error_code="openai_authentication_failed",
+            error_message="OPENAI_API_KEY tidak valid."
         )
         return {
             "error": "openai_authentication_failed",
@@ -714,8 +812,9 @@ def process_chat_request(payload):
         inferred_parent if inferred_parent != "lainnya" else None
     )
     df_retrieval = pd.DataFrame(dataset)
+    retrieval_candidates = len(df_retrieval)
     logger.info(
-        f"[RETRIEVAL] intent_parent={inferred_parent} | candidates={len(df_retrieval)}"
+        f"[RETRIEVAL] intent_parent={inferred_parent} | candidates={retrieval_candidates}"
     )
 
     if df_retrieval.empty:
@@ -731,6 +830,12 @@ def process_chat_request(payload):
             priority_score=50,
             embedding=query_embedding
         )
+        write_log(
+            status="success_empty_retrieval",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            admin_response=bot_text
+        )
         return {
             "status": "ok",
             "admin_response": bot_text
@@ -739,10 +844,13 @@ def process_chat_request(payload):
     matches_df = retrieve_top_k(query_embedding, df_retrieval, TOP_K)
     if not matches_df.empty:
         top = matches_df.iloc[0]
+        top_similarity = float(top["similarity"])
+        top_priority_score = float(top["priority_score"])
+        top_final_score = float(top["final_score"])
         logger.info(
-            f"[TOP MATCH] sim={top['similarity']:.4f} | "
-            f"priority={top['priority_score']} | "
-            f"final={top['final_score']}"
+            f"[TOP MATCH] sim={top_similarity:.4f} | "
+            f"priority={top_priority_score} | "
+            f"final={top_final_score}"
         )
     else:
         logger.warning(
@@ -772,12 +880,26 @@ def process_chat_request(payload):
             f"[CLAUDE GENERATION ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
         )
+        write_log(
+            status="claude_generation_failed",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            error_code="claude_generation_failed",
+            error_message=str(e)
+        )
         return {
             "error": "claude_generation_failed",
             "message": str(e)
         }, 502
 
     if not draft_text:
+        write_log(
+            status="claude_generation_empty",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            error_code="claude_generation_failed",
+            error_message="Claude tidak mengembalikan respons."
+        )
         return {
             "error": "claude_generation_failed",
             "message": "Claude tidak mengembalikan respons."
@@ -834,8 +956,22 @@ def process_chat_request(payload):
             f"[DB ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
         )
+        write_log(
+            status="chat_db_error",
+            conversation_id=conversation_id,
+            user_query=user_query,
+            error_code="chat_db_error",
+            error_message=str(e),
+            admin_response=bot_text
+        )
         raise
 
+    write_log(
+        status="success",
+        conversation_id=conversation_id,
+        user_query=user_query,
+        admin_response=bot_text
+    )
     return {
         "status": "ok",
         "save_mode": "saved_to_dataset",
