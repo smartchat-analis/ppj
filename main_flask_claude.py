@@ -22,7 +22,7 @@ from db import fetch_context
 from db import fetch_dataset_by_intent
 from db import fetch_next_turn_index
 from db import insert_chat_pair
-from log_db import init_log_db, insert_chat_log
+from log_db import init_log_db, start_request_log, finalize_request_log
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -183,7 +183,7 @@ def classify_intent_gpt(user_text, context):
         - tanya_fasilitas
         - tanya_domain
 
-    Jika inferred_parent = revisi:
+    Jika inferred_parent = minta_revisi:
         - revisi_konten
         - revisi_artikel
         - revisi_gambar
@@ -634,7 +634,15 @@ def home():
 @app.route("/chat", methods=["POST"])
 def chat():
     payload = request.get_json(silent=True) or {}
-    future = CHAT_EXECUTOR.submit(process_chat_request, payload)
+    request_id = str(uuid.uuid4())
+    user_query = normalize_user_query(payload.get("query") or payload.get("q"))
+    start_request_log(
+        request_id=request_id,
+        payload=payload,
+        thread_name=threading.current_thread().name,
+        user_query=user_query,
+    )
+    future = CHAT_EXECUTOR.submit(process_chat_request, payload, request_id)
     try:
         result, status_code = future.result(timeout=CHAT_TIMEOUT_SECONDS)
         return jsonify(result), status_code
@@ -643,13 +651,15 @@ def chat():
             f"[CHAT TIMEOUT] exceeded {CHAT_TIMEOUT_SECONDS} seconds"
         )
         try:
-            insert_chat_log({
-                "status": "chat_timeout",
-                "error_code": "chat_timeout",
-                "error_message": f"exceeded {CHAT_TIMEOUT_SECONDS} seconds",
-                "payload": payload,
-                "thread_name": threading.current_thread().name,
-            })
+            finalize_request_log(
+                request_id=request_id,
+                status="chat_timeout",
+                http_status=504,
+                error_code="chat_timeout",
+                error_message=f"exceeded {CHAT_TIMEOUT_SECONDS} seconds",
+                payload=payload,
+                thread_name=threading.current_thread().name,
+            )
         except Exception:
             logger.exception("[LOG_DB ERROR] failed to write chat_timeout log")
         return jsonify({
@@ -659,13 +669,15 @@ def chat():
     except Exception as e:
         logger.exception(f"[CHAT EXECUTOR ERROR] {str(e)}")
         try:
-            insert_chat_log({
-                "status": "chat_processing_failed",
-                "error_code": "chat_processing_failed",
-                "error_message": str(e),
-                "payload": payload,
-                "thread_name": threading.current_thread().name,
-            })
+            finalize_request_log(
+                request_id=request_id,
+                status="chat_processing_failed",
+                http_status=500,
+                error_code="chat_processing_failed",
+                error_message=str(e),
+                payload=payload,
+                thread_name=threading.current_thread().name,
+            )
         except Exception:
             logger.exception("[LOG_DB ERROR] failed to write chat_processing_failed log")
         return jsonify({
@@ -673,7 +685,7 @@ def chat():
             "message": str(e)
         }), 500
 
-def process_chat_request(payload):
+def process_chat_request(payload, request_id):
     started_at = time.perf_counter()
     thread_name = threading.current_thread().name
     session_id = str(uuid.uuid4())
@@ -689,35 +701,37 @@ def process_chat_request(payload):
     top_final_score = None
     draft_text = None
     bot_text = None
-
-    def write_log(status, conversation_id, user_query, error_code=None, error_message=None, admin_response=None):
+    def finalize_and_return(response, http_status, status, error_code=None, error_message=None):
         try:
             duration_ms = int((time.perf_counter() - started_at) * 1000)
-            insert_chat_log({
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "status": status,
-                "error_code": error_code,
-                "error_message": error_message,
-                "user_query": user_query,
-                "context_turns": len(context_list),
-                "context_text": context_text,
-                "intent_parent": inferred_parent,
-                "intent_child": inferred_child,
-                "retrieval_candidates": retrieval_candidates,
-                "top_similarity": top_similarity,
-                "top_priority_score": top_priority_score,
-                "top_final_score": top_final_score,
-                "matches": matches_summary,
-                "layer1_draft": draft_text,
-                "layer2_final": bot_text,
-                "admin_response": admin_response,
-                "payload": payload,
-                "duration_ms": duration_ms,
-                "thread_name": thread_name,
-            })
+            finalize_request_log(
+                request_id=request_id,
+                status=status,
+                http_status=http_status,
+                error_code=error_code,
+                error_message=error_message,
+                conversation_id=conversation_id if isinstance(conversation_id, int) else None,
+                session_id=session_id,
+                user_query=user_query,
+                context_turns=len(context_list),
+                context_text=context_text,
+                intent_parent=inferred_parent,
+                intent_child=inferred_child,
+                retrieval_candidates=retrieval_candidates,
+                top_similarity=top_similarity,
+                top_priority_score=top_priority_score,
+                top_final_score=top_final_score,
+                matches=matches_summary,
+                layer1_draft=draft_text,
+                layer2_final=bot_text,
+                admin_response=bot_text,
+                payload=payload,
+                thread_name=thread_name,
+                duration_ms=duration_ms,
+            )
         except Exception as e:
-            logger.error(f"[LOG_DB ERROR] session_id={session_id} | {str(e)}", exc_info=True)
+            logger.error(f"[LOG_DB ERROR] request_id={request_id} | {str(e)}", exc_info=True)
+        return response, http_status
 
     user_query = normalize_user_query(payload.get("query") or payload.get("q"))
     conversation_id = payload.get("conversation_id")
@@ -728,17 +742,10 @@ def process_chat_request(payload):
         else:
             conversation_id = int(uuid.uuid4().int % 1_000_000_000)
     except (TypeError, ValueError):
-        write_log(
-            status="invalid_conversation_id",
-            conversation_id=None,
-            user_query=user_query,
-            error_code="invalid_conversation_id",
-            error_message="conversation_id harus integer"
-        )
-        return {
+        return finalize_and_return({
             "error": "invalid_conversation_id",
             "message": "conversation_id harus integer"
-        }, 400
+        }, 400, "invalid_conversation_id", "invalid_conversation_id", "conversation_id harus integer")
 
     logger.info(
         f"[REQUEST] conversation_id={conversation_id} | query='{user_query}'"
@@ -747,14 +754,7 @@ def process_chat_request(payload):
         logger.warning(
             f"[INVALID REQUEST] conversation_id={conversation_id} | empty query"
         )
-        write_log(
-            status="invalid_request",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            error_code="query_required",
-            error_message="query required"
-        )
-        return {"error": "query required"}, 400
+        return finalize_and_return({"error": "query required"}, 400, "invalid_request", "query_required", "query required")
 
     # === CONTEXT ===
     context_list = fetch_context(conversation_id)
@@ -777,17 +777,10 @@ def process_chat_request(payload):
         logger.exception(
             f"[OPENAI AUTH ERROR] session_id={session_id} | invalid OPENAI_API_KEY"
         )
-        write_log(
-            status="openai_auth_failed",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            error_code="openai_authentication_failed",
-            error_message="OPENAI_API_KEY tidak valid."
-        )
-        return {
+        return finalize_and_return({
             "error": "openai_authentication_failed",
             "message": "OPENAI_API_KEY tidak valid."
-        }, 401
+        }, 401, "openai_auth_failed", "openai_authentication_failed", "OPENAI_API_KEY tidak valid.")
 
     # === GET INTENT RESULT ===
     try:
@@ -830,16 +823,10 @@ def process_chat_request(payload):
             priority_score=50,
             embedding=query_embedding
         )
-        write_log(
-            status="success_empty_retrieval",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            admin_response=bot_text
-        )
-        return {
+        return finalize_and_return({
             "status": "ok",
             "admin_response": bot_text
-        }, 200
+        }, 200, "success_empty_retrieval")
 
     matches_df = retrieve_top_k(query_embedding, df_retrieval, TOP_K)
     if not matches_df.empty:
@@ -880,30 +867,16 @@ def process_chat_request(payload):
             f"[CLAUDE GENERATION ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
         )
-        write_log(
-            status="claude_generation_failed",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            error_code="claude_generation_failed",
-            error_message=str(e)
-        )
-        return {
+        return finalize_and_return({
             "error": "claude_generation_failed",
             "message": str(e)
-        }, 502
+        }, 502, "claude_generation_failed", "claude_generation_failed", str(e))
 
     if not draft_text:
-        write_log(
-            status="claude_generation_empty",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            error_code="claude_generation_failed",
-            error_message="Claude tidak mengembalikan respons."
-        )
-        return {
+        return finalize_and_return({
             "error": "claude_generation_failed",
             "message": "Claude tidak mengembalikan respons."
-        }, 502
+        }, 502, "claude_generation_empty", "claude_generation_failed", "Claude tidak mengembalikan respons.")
 
     logger.info(
         f"[LAYER-1 DRAFT] session_id={session_id} | "
@@ -956,23 +929,10 @@ def process_chat_request(payload):
             f"[DB ERROR] session_id={session_id} | {str(e)}",
             exc_info=True
         )
-        write_log(
-            status="chat_db_error",
-            conversation_id=conversation_id,
-            user_query=user_query,
-            error_code="chat_db_error",
-            error_message=str(e),
-            admin_response=bot_text
-        )
+        finalize_and_return({}, 500, "chat_db_error", "chat_db_error", str(e))
         raise
 
-    write_log(
-        status="success",
-        conversation_id=conversation_id,
-        user_query=user_query,
-        admin_response=bot_text
-    )
-    return {
+    return finalize_and_return({
         "status": "ok",
         "save_mode": "saved_to_dataset",
         "session_id": session_id,
@@ -981,7 +941,7 @@ def process_chat_request(payload):
         "intent_parent": inferred_parent,
         "intent_child": inferred_child,
         "matches": matches_summary
-    }, 200
+    }, 200, "success")
 
 # ============================================================
 # ENDPOINT /feedback
