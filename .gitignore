@@ -1,6 +1,7 @@
 /data/*
 /model/*
 chatbot.db
+log.db
 .env
 __pycache__/
 *.pyc
