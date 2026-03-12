@@ -350,7 +350,7 @@ def build_prompt_from_matches(user_text, matches_df):
     - Jika user menanyakan informasi tambahan untuk biaya perpanjangan, maka gunakan fill_user_info_ppj({{$biaya_ppj_web}}, plus_or_minus, value)
         untuk menjelaskan biaya perpanjangan dengan penambahan atau pengurangan tertentu, misalnya untuk layanan tambahan atau diskon.
         Aplikasinya seperti ini: 
-        - Jika terdapat tambahan biaya layanan, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 100000) karena ada tambahan layanan X 
+        - Jika terdapat tambahan biaya layanan, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 300000) karena ada tambahan layanan X 
         - Jika terdapat diskon, maka biaya perpanjangan adalah fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000) karena mendapatkan diskon Y
         - Jika tidak ada tambahan biaya atau diskon, maka cukup sebutkan biaya perpanjangan adalah {{$biaya_ppj_web}} tanpa perlu menggunakan fill_user_info_ppj
     - Maka, untuk layanan tambahan output placeholder {{$biaya_ppj_web}} adalah hasil dari fill_user_info_ppj yang sudah dihitung dan dijelaskan operasinya.
@@ -460,6 +460,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     1. DATA YANG WAJIB DILINDUNGI DENGAN PLACEHOLDER:
         - Jatuh tempo / tanggal aktif
         - Nama domain klien
+        - Biaya perpanjangan
 
         Data ini TIDAK BOLEH muncul sebagai angka, tanggal, atau teks nyata.
         WAJIB menggunakan placeholder {{...}} jika relevan.
@@ -476,7 +477,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
         - Periksa konteks kalimatnya
         - Jika angka terkait DATA KLIEN GUNAKAN PLACEHOLDER
         - Jika angka terkait DATA UMUM BIARKAN
-        - Jika angka terkait BIAYA PERPANJANGAN, pastikan untuk menggunakan fungsi fill_user_info_ppj jika ada operasi tambahan atau diskon, sehingga angka final tetap dalam placeholder.
+        - Jika angka terkait BIAYA PERPANJANGAN, pastikan untuk menggunakan fungsi fill_user_info_ppj jika ada operasi tambahan atau diskon
 
     4. DILARANG:
         - Menghapus nomor rekening yang sudah benar
@@ -503,6 +504,7 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     1. BOLEH:
     - "Biaya perpanjangan: {{$biaya_ppj_web}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
+    - "Biaya yang perlu disiapkan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 300000) karena ada tambahan layanan X"
 
     2. DILARANG:
     - "informasi {{$biaya_ppj_web}}"
