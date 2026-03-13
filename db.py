@@ -164,3 +164,19 @@ def apply_feedback_db(session_id, rating):
 
     return updated > 0
 
+# ===============================
+# UPDATE ADMIN RESPONSE
+# ===============================
+def update_admin_response_by_session(session_id, admin_response):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE chat_pairs
+        SET admin_response = ?
+        WHERE session_id = ?
+    """, (admin_response, session_id))
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+    return updated > 0
+

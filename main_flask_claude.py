@@ -22,7 +22,9 @@ from db import fetch_context
 from db import fetch_dataset_by_intent
 from db import fetch_next_turn_index
 from db import insert_chat_pair
-from log_db import init_log_db, start_request_log, finalize_request_log
+from db import update_admin_response_by_session
+from log_db import init_log_db, start_request_log, finalize_request_log, update_request_log
+# from payment_proof import detect_receipt_urls, extract_urls_from_text
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -65,6 +67,7 @@ CHAT_EXECUTOR = ThreadPoolExecutor(
 )
 CHAT_TIMEOUT_SECONDS = int(os.getenv("CHAT_TIMEOUT_SECONDS", "120"))
 init_log_db()
+# PAYMENT_CACHE_PATH = "data/receipt_cache_vision.json"
 
 # ============================================================
 # PLACEHOLDERS
@@ -96,6 +99,30 @@ def normalize_user_query(text):
     last_user = re.split(r"\bassistant\s*:\b", last_user, flags=re.I)[0]
 
     return last_user.strip()
+
+def parse_transcript(text):
+    if not text:
+        return []
+    lines = str(text).splitlines()
+    messages = []
+    for line in lines:
+        m = re.match(r"^\s*(user|assistant|admin)\s*:\s*(.*)$", line, flags=re.I)
+        if m:
+            role = m.group(1).lower()
+            role = "assistant" if role in ("assistant", "admin") else "user"
+            content = m.group(2).strip()
+            messages.append([role, content])
+            continue
+        if messages:
+            messages[-1][1] = (messages[-1][1] + "\n" + line.strip()).strip()
+    return [(r, c) for r, c in messages if c]
+
+def build_context_from_transcript(messages, last_user_idx):
+    ctx = []
+    for role, content in messages[:last_user_idx]:
+        label = "USER" if role == "user" else "ADMIN"
+        ctx.append(f"{label}:{content}")
+    return ctx
 
 def handle_llm_claude(messages, system_prompt=None, model=CLAUDE_MODEL, max_tokens=1024, temperature=0):
     if Anthropic is None:
@@ -496,6 +523,8 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     1. Jika placeholder WAJIB belum muncul:
     - Tambahkan placeholder tersebut secara natural
     - Gunakan struktur kalimat yang sederhana
+    - PENTING: Jika draft sudah memakai format `fill_user_info_ppj({{$biaya_ppj_web}}, plus_or_minus, value)`
+      untuk penyesuaian biaya, JANGAN mengganti format ini menjadi placeholder biasa.
 
     2. Placeholder adalah NILAI FINAL:
         - BUKAN objek
@@ -504,11 +533,13 @@ def enforce_placeholders(user_text, draft_text, inferred_child):
     1. BOLEH:
     - "Biaya perpanjangan: {{$biaya_ppj_web}}"
     - "Masa aktif website berlaku sampai {{$jatuh_tempo}}"
+    - "Biaya setelah diskon: fill_user_info_ppj({{$biaya_ppj_web}}, minus, 50000)"
     - "Biaya yang perlu disiapkan adalah fill_user_info_ppj({{$biaya_ppj_web}}, plus, 300000) karena ada tambahan layanan X"
 
     2. DILARANG:
     - "informasi {{$biaya_ppj_web}}"
     - "detail {{$domain_klien}}"
+    - Mengubah `fill_user_info_ppj(...)` menjadi `{{$biaya_ppj_web}}` saja
 
     3. Placeholder TIDAK BOLEH:
     - didahului kata: pada, di, tentang, seputar, informasi, detail, yaitu
@@ -593,12 +624,14 @@ def save_chat_to_db(
     priority_score: int = 50,
     embedding: list = None,
     context: list = None,
-    session_id: str = None
+    session_id: str = None,
+    turn_index: int = None
 ):
     if session_id is None:
         session_id = str(uuid.uuid4())
 
-    turn_index = fetch_next_turn_index(conversation_id)
+    if turn_index is None:
+        turn_index = fetch_next_turn_index(conversation_id)
 
     insert_chat_pair({
         "conversation_id": conversation_id,
@@ -637,7 +670,12 @@ def home():
 def chat():
     payload = request.get_json(silent=True) or {}
     request_id = str(uuid.uuid4())
-    user_query = normalize_user_query(payload.get("query") or payload.get("q"))
+    raw_query = payload.get("query") or payload.get("q")
+    parsed = parse_transcript(raw_query)
+    if parsed:
+        user_query = next((c for r, c in reversed(parsed) if r == "user"), "")
+    else:
+        user_query = normalize_user_query(raw_query)
     start_request_log(
         request_id=request_id,
         payload=payload,
@@ -703,9 +741,12 @@ def process_chat_request(payload, request_id):
     top_final_score = None
     draft_text = None
     bot_text = None
+    admin_response_sent = None
+    admin_response_edited = None
     def finalize_and_return(response, http_status, status, error_code=None, error_message=None):
         try:
             duration_ms = int((time.perf_counter() - started_at) * 1000)
+            admin_response_for_log = admin_response_sent or bot_text
             finalize_request_log(
                 request_id=request_id,
                 status=status,
@@ -726,7 +767,10 @@ def process_chat_request(payload, request_id):
                 matches=matches_summary,
                 layer1_draft=draft_text,
                 layer2_final=bot_text,
-                admin_response=bot_text,
+                placeholder_guard_applied=1 if (draft_text and bot_text and draft_text != bot_text) else 0,
+                admin_response=admin_response_for_log,
+                admin_response_sent=admin_response_sent,
+                admin_response_edited=admin_response_edited,
                 payload=payload,
                 thread_name=thread_name,
                 duration_ms=duration_ms,
@@ -735,7 +779,25 @@ def process_chat_request(payload, request_id):
             logger.error(f"[LOG_DB ERROR] request_id={request_id} | {str(e)}", exc_info=True)
         return response, http_status
 
-    user_query = normalize_user_query(payload.get("query") or payload.get("q"))
+    raw_query = payload.get("query") or payload.get("q")
+    parsed = parse_transcript(raw_query)
+    use_transcript_context = False
+    if parsed:
+        last_user_idx = max((i for i, (r, _) in enumerate(parsed) if r == "user"), default=None)
+        if last_user_idx is not None:
+            user_query = parsed[last_user_idx][1]
+            context_list = build_context_from_transcript(parsed, last_user_idx)
+            context_text = "\n".join(context_list)
+            use_transcript_context = True
+            # Use the last assistant message before the last user as final admin response sent.
+            for i in range(last_user_idx - 1, -1, -1):
+                if parsed[i][0] == "assistant":
+                    admin_response_sent = parsed[i][1]
+                    break
+        else:
+            user_query = normalize_user_query(raw_query)
+    else:
+        user_query = normalize_user_query(raw_query)
     conversation_id = payload.get("conversation_id")
 
     try:
@@ -759,8 +821,9 @@ def process_chat_request(payload, request_id):
         return finalize_and_return({"error": "query required"}, 400, "invalid_request", "query_required", "query required")
 
     # === CONTEXT ===
-    context_list = fetch_context(conversation_id)
-    context_text = "\n".join(context_list)
+    if not use_transcript_context:
+        context_list = fetch_context(conversation_id)
+        context_text = "\n".join(context_list)
     logger.debug(
         f"[CONTEXT] conversation_id={conversation_id} | turns={len(context_list)}"
     )
@@ -814,6 +877,9 @@ def process_chat_request(payload, request_id):
 
     if df_retrieval.empty:
         bot_text = "Baik kak, untuk hal ini kami perlu cek dulu ke tim terkait ya 🙏"
+        turn_index = None
+        if use_transcript_context and context_list:
+            turn_index = sum(1 for c in context_list if c.startswith("USER:")) + 1
         save_chat_to_db(
             conversation_id=conversation_id,
             session_id=session_id,
@@ -823,7 +889,8 @@ def process_chat_request(payload, request_id):
             intent_parent=inferred_parent,
             intent_child=inferred_child,
             priority_score=50,
-            embedding=query_embedding
+            embedding=query_embedding,
+            turn_index=turn_index
         )
         return finalize_and_return({
             "status": "ok",
@@ -893,6 +960,8 @@ def process_chat_request(payload, request_id):
         draft_text,
         inferred_child
     )
+    if admin_response_sent:
+        admin_response_edited = 1 if admin_response_sent.strip() != bot_text.strip() else 0
     logger.info(
         f"[LAYER-2 FINAL] session_id={session_id} | "
         f"answer={bot_text}"
@@ -908,7 +977,11 @@ def process_chat_request(payload, request_id):
     )
 
     # === SAVE ===
-    turn_index = fetch_next_turn_index(conversation_id)
+    turn_index = None
+    if use_transcript_context and context_list:
+        turn_index = sum(1 for c in context_list if c.startswith("USER:")) + 1
+    if turn_index is None:
+        turn_index = fetch_next_turn_index(conversation_id)
     logger.info(
         f"[DB INSERT] conversation_id={conversation_id} | "
         f"turn_index={turn_index} | session_id={session_id}"
@@ -924,7 +997,12 @@ def process_chat_request(payload, request_id):
             intent_parent=inferred_parent,
             intent_child=inferred_child,
             priority_score=50,
-            embedding=query_embedding
+            embedding=query_embedding,
+            turn_index=turn_index
+        )
+        logger.info(
+            f"[DB SAVED] chatbot.db saved | conversation_id={conversation_id} | "
+            f"turn_index={turn_index} | session_id={session_id}"
         )
     except Exception as e:
         logger.critical(
@@ -934,7 +1012,7 @@ def process_chat_request(payload, request_id):
         finalize_and_return({}, 500, "chat_db_error", "chat_db_error", str(e))
         raise
 
-    return finalize_and_return({
+    response, status_code = finalize_and_return({
         "status": "ok",
         "save_mode": "saved_to_dataset",
         "session_id": session_id,
@@ -944,6 +1022,10 @@ def process_chat_request(payload, request_id):
         "intent_child": inferred_child,
         "matches": matches_summary
     }, 200, "success")
+    logger.info(
+        f"[LOG SAVED] log.db saved | request_id={request_id} | session_id={session_id} | status=success"
+    )
+    return response, status_code
 
 # ============================================================
 # ENDPOINT /feedback
@@ -983,8 +1065,65 @@ def feedback():
     })
 
 # ============================================================
+# ENDPOINT /payment-proof
+# ============================================================
+
+# @app.route("/payment-proof", methods=["POST"])
+# def payment_proof():
+#     payload = request.get_json(silent=True) or {}
+#     urls = []
+#
+#     single_url = payload.get("image_url") or payload.get("media_url") or payload.get("url")
+#     if single_url:
+#         urls.append(single_url)
+#
+#     for key in ("urls", "media_urls"):
+#         val = payload.get(key)
+#         if isinstance(val, list):
+#             urls.extend([u for u in val if u])
+#
+#     text_blob = payload.get("text") or payload.get("message") or payload.get("caption")
+#     if text_blob:
+#         urls.extend(extract_urls_from_text(text_blob))
+#
+#     seen = set()
+#     deduped = []
+#     for u in urls:
+#         if u and u not in seen:
+#             seen.add(u)
+#             deduped.append(u)
+#
+#     if not deduped:
+#         return jsonify({
+#             "error": "no_media_url",
+#             "message": "Kirimkan image_url atau media_urls untuk cek bukti bayar."
+#         }), 400
+#
+#     results, model = detect_receipt_urls(CLIENT, deduped, PAYMENT_CACHE_PATH)
+#     proof = next((r for r in results if r.get("is_receipt")), None)
+#
+#     return jsonify({
+#         "status": "ok",
+#         "conversation_id": payload.get("conversation_id"),
+#         "receipt_detected": bool(proof),
+#         "payment_detected": 1 if proof else 0,
+#         "payment_type": "payment_image_detected" if proof else "none",
+#         "proof_available": 1 if proof else 0,
+#         "proof_url": proof.get("url") if proof else None,
+#         "proof_payment_value": proof.get("payment_value") if proof else None,
+#         "proof_reason": proof.get("reason") if proof else None,
+#         "trigger_payment_check": True if proof else False,
+#         "model": model,
+#         "results": results
+#     })
+
+# ============================================================
 # RUN SERVER
 # ============================================================
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8080, debug=True)
+
+
+
+

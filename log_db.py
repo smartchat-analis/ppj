@@ -1,8 +1,9 @@
 import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
-LOG_DB_PATH = "log.db"
+LOG_DB_PATH = str(Path(__file__).resolve().parent / "log.db")
 
 
 def _get_conn():
@@ -49,6 +50,8 @@ def init_log_db():
             layer2_final TEXT,
             placeholder_guard_applied INTEGER,
             admin_response TEXT,
+            admin_response_sent TEXT,
+            admin_response_edited INTEGER,
             payload_json TEXT,
             thread_name TEXT
         )
@@ -63,6 +66,8 @@ def init_log_db():
         "duration_ms": "INTEGER",
         "http_status": "INTEGER",
         "placeholder_guard_applied": "INTEGER",
+        "admin_response_sent": "TEXT",
+        "admin_response_edited": "INTEGER",
     }
     for col, col_type in required_cols.items():
         if not _col_exists(cur, "chat_logs", col):
@@ -133,6 +138,8 @@ def update_request_log(request_id, **fields):
         "layer2_final": "layer2_final",
         "placeholder_guard_applied": "placeholder_guard_applied",
         "admin_response": "admin_response",
+        "admin_response_sent": "admin_response_sent",
+        "admin_response_edited": "admin_response_edited",
         "thread_name": "thread_name",
         "http_status": "http_status",
         "duration_ms": "duration_ms",
@@ -165,6 +172,72 @@ def update_request_log(request_id, **fields):
     conn.commit()
     conn.close()
 
+def update_request_log_by_session(session_id, **fields):
+    if not fields or not session_id:
+        return
+
+    col_map = {
+        "conversation_id": "conversation_id",
+        "session_id": "session_id",
+        "status": "status",
+        "error_code": "error_code",
+        "error_message": "error_message",
+        "user_query": "user_query",
+        "context_turns": "context_turns",
+        "context_text": "context_text",
+        "intent_parent": "intent_parent",
+        "intent_child": "intent_child",
+        "retrieval_candidates": "retrieval_candidates",
+        "top_similarity": "top_similarity",
+        "top_priority_score": "top_priority_score",
+        "top_final_score": "top_final_score",
+        "layer1_draft": "layer1_draft",
+        "layer2_final": "layer2_final",
+        "placeholder_guard_applied": "placeholder_guard_applied",
+        "admin_response": "admin_response",
+        "admin_response_sent": "admin_response_sent",
+        "admin_response_edited": "admin_response_edited",
+        "thread_name": "thread_name",
+        "http_status": "http_status",
+        "duration_ms": "duration_ms",
+        "ended_at": "ended_at",
+        "matches": "matches_json",
+        "payload": "payload_json",
+    }
+
+    sets = []
+    values = []
+    for key, value in fields.items():
+        col = col_map.get(key)
+        if not col:
+            continue
+        if key in ("matches", "payload"):
+            value = json.dumps(value or ([] if key == "matches" else {}), ensure_ascii=False)
+        sets.append(f"{col} = ?")
+        values.append(value)
+
+    if not sets:
+        return
+
+    values.append(session_id)
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        UPDATE chat_logs
+        SET {', '.join(sets)}
+        WHERE id = (
+            SELECT id FROM chat_logs
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        )
+        """,
+        values,
+    )
+    conn.commit()
+    conn.close()
+
 def finalize_request_log(request_id, status, http_status, **fields):
     fields["status"] = status
     fields["http_status"] = http_status
@@ -190,6 +263,8 @@ def finalize_request_log(request_id, status, http_status, **fields):
         "layer2_final": "layer2_final",
         "placeholder_guard_applied": "placeholder_guard_applied",
         "admin_response": "admin_response",
+        "admin_response_sent": "admin_response_sent",
+        "admin_response_edited": "admin_response_edited",
         "payload": "payload_json",
         "matches": "matches_json",
         "thread_name": "thread_name",
